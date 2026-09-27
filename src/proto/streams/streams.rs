@@ -789,6 +789,7 @@ impl Inner {
         });
 
         actions.conn_error = Some(err);
+        actions.recv.refund_credit();
 
         last_processed_id
     }
@@ -961,6 +962,7 @@ impl Inner {
         });
 
         actions.clear_queues(clear_pending_accept, &mut self.store, counts);
+        actions.recv.refund_credit();
         Ok(())
     }
 
