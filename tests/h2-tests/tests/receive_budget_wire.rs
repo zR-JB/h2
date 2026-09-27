@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use http::Response;
+use std::convert::TryInto;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},

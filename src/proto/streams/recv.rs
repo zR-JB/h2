@@ -1323,6 +1323,8 @@ mod tests {
         assert!(stream.pending_recv.is_empty());
         assert_eq!(stream.in_flight_recv_data, 0);
         assert_eq!(recv.in_flight_data, 0);
+        stream.unlink();
+        stream.remove();
     }
 }
 
