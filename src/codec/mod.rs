@@ -121,6 +121,10 @@ impl<T, B> Codec<T, B> {
         self.framed_write().take_last_data_frame()
     }
 
+    pub(crate) fn discard_pending_data(&mut self) {
+        self.framed_write().discard_pending_data();
+    }
+
     fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
         self.inner.get_mut()
     }
