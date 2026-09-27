@@ -310,3 +310,146 @@ async fn tiny_send_events_backpressure_and_refund_with_one_byte_window_updates()
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn header_metadata_refusal_preserves_ordinary_fields_and_hpack_siblings() {
+    use http::{header::HeaderName, HeaderMap};
+    use std::hash::{Hash, Hasher};
+
+    struct Fnv(u64);
+    impl Hasher for Fnv {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            for byte in bytes {
+                self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    let mut hostile = HeaderMap::new();
+    let mut names: Vec<String> = (0..205).map(|i| format!("h{i:03x}")).collect();
+    for name in &names {
+        hostile.append(
+            name.parse::<HeaderName>().unwrap(),
+            http::HeaderValue::from_static(""),
+        );
+    }
+    for i in 0u32.. {
+        let name: HeaderName = format!("x{i:x}").parse().unwrap();
+        let mut hash = Fnv(0xcbf29ce484222325);
+        name.hash(&mut hash);
+        if hash.finish() & 4095 == 0 {
+            names.push(name.as_str().to_owned());
+            hostile.append(name, http::HeaderValue::from_static(""));
+            if hostile.capacity() > 1536 {
+                break;
+            }
+        }
+        assert!(i < 10_000_000, "collision fixture failed to grow");
+    }
+    assert!(names.iter().map(|name| name.len() + 32).sum::<usize>() < 32 * 1024 - 200);
+    let literal = |block: &mut Vec<u8>, name: &str| {
+        assert!(name.len() < 127);
+        block.extend_from_slice(&[0, name.len() as u8]);
+        block.extend_from_slice(name.as_bytes());
+        block.push(0);
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted, mut observed) = tokio::sync::mpsc::channel(8);
+        let (trailer_done, trailer_end) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut builder = h2::server::Builder::new();
+            builder
+                .initial_window_size(8 * 1024 * 1024)
+                .initial_connection_window_size(16 * 1024 * 1024)
+                .max_concurrent_streams(250)
+                .max_header_list_size(32 * 1024);
+            let mut connection = builder.handshake::<_, Bytes>(socket).await.unwrap();
+            let mut trailer_done = Some(trailer_done);
+            while let Some(result) = connection.accept().await {
+                let (request, mut reply) = result.unwrap();
+                let id = request.body().stream_id().as_u32();
+                assert!(request.headers().capacity() <= 1536);
+                accepted
+                    .send((
+                        id,
+                        request.headers().len(),
+                        request.headers().get("x-sync").cloned(),
+                    ))
+                    .await
+                    .unwrap();
+                if id == 9 {
+                    let mut body = request.into_body();
+                    let done = trailer_done.take().unwrap();
+                    tokio::spawn(async move {
+                        done.send(body.trailers().await.unwrap_err().reason())
+                            .unwrap();
+                    });
+                } else {
+                    reply.send_response(Response::new(()), true).unwrap();
+                }
+            }
+        });
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        frame(&mut socket, 4, 0, 0, &[]).await;
+        for (id, duplicate) in [(1, false), (3, true)] {
+            let mut block = b"\x82\x87\x84\x01\x09localhost".to_vec();
+            for i in 0..if duplicate { 980 } else { 880 } {
+                literal(
+                    &mut block,
+                    &if duplicate {
+                        "a".into()
+                    } else {
+                        format!("h{i:03x}")
+                    },
+                );
+            }
+            frame(&mut socket, 1, 5, id, &block).await;
+            let (seen, count, _) = observed.recv().await.unwrap();
+            assert_eq!((seen, count), (id, if duplicate { 980 } else { 880 }));
+        }
+        let mut block = b"\x82\x87\x84\x01\x09localhost".to_vec();
+        for name in &names {
+            literal(&mut block, name);
+        }
+        block.extend_from_slice(b"\x40\x06x-sync\x01v");
+        frame(&mut socket, 1, 4, 5, &block).await;
+        frame(&mut socket, 1, 5, 7, b"\x82\x87\x84\x01\x09localhost\xbe").await;
+        let (seen, count, sync) = observed.recv().await.unwrap();
+        assert_eq!((seen, count), (7, 1));
+        assert_eq!(sync.unwrap(), "v");
+        let mut refused = false;
+        while !refused {
+            let (kind, id, payload) = next(&mut socket).await;
+            assert_ne!(kind, 7, "metadata refusal must remain stream-local");
+            if kind == 3 && id == 5 {
+                assert_eq!(payload, u32::from(h2::Reason::PROTOCOL_ERROR).to_be_bytes());
+                refused = true;
+            }
+        }
+        frame(&mut socket, 1, 4, 9, b"\x82\x87\x84\x01\x09localhost").await;
+        assert_eq!(observed.recv().await.unwrap().0, 9);
+        let mut trailers = Vec::new();
+        for name in &names {
+            literal(&mut trailers, name);
+        }
+        trailers.extend_from_slice(b"\x40\x06x-sync\x01w");
+        frame(&mut socket, 1, 5, 9, &trailers).await;
+        frame(&mut socket, 1, 5, 11, b"\x82\x87\x84\x01\x09localhost\xbe").await;
+        let (seen, _, sync) = observed.recv().await.unwrap();
+        assert_eq!(seen, 11);
+        assert_eq!(sync.unwrap(), "w");
+        assert_eq!(trailer_end.await.unwrap(), Some(h2::Reason::PROTOCOL_ERROR));
+        task.abort();
+    })
+    .await
+    .unwrap();
+}
