@@ -259,7 +259,6 @@ impl Stream {
             self.buffered_send_data == 0 && self.buffered_send_frames == 0
     }
 
-    /// Returns true if the stream is no longer in use
     pub fn settle_charges(&mut self, send_frame_bytes: usize) {
         if self.ref_count == 0 && self.pending_recv.is_empty() {
             self.recv_headers_charge.shrink_to(0);
@@ -268,6 +267,7 @@ impl Stream {
             .shrink_to(self.buffered_send_frames * send_frame_bytes);
     }
 
+    /// Returns true if the stream is no longer in use
     pub fn is_released(&self) -> bool {
         // The stream is closed and fully flushed
         self.is_closed() &&
