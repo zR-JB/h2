@@ -69,7 +69,6 @@ pub(super) enum Event {
 #[derive(Debug)]
 pub(super) struct DataEvent {
     pub(super) payload: Bytes,
-    pub(super) is_budgeted: bool,
 }
 
 #[derive(Debug)]
@@ -648,7 +647,12 @@ impl Recv {
         stream.pending_recv.is_empty()
     }
 
-    pub fn recv_data(&mut self, frame: frame::Data, stream: &mut store::Ptr) -> Result<(), Error> {
+    pub fn recv_data(
+        &mut self,
+        frame: frame::Data,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) -> Result<(), Error> {
         // could include padding
         let sz = frame.flow_controlled_len();
 
@@ -764,13 +768,17 @@ impl Recv {
         // message. Padding has already been accounted for and released above,
         // so there is no event to pass to the user.
         if frame.payload().is_empty() && !frame.is_end_stream() {
-            return Ok(());
+            return counts.record_empty_data_frame().map_err(|_| {
+                Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
+            });
         }
 
-        let is_budgeted = !frame.is_end_stream();
+        counts.record_data_frame().map_err(|_| {
+            Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
+        })?;
+        let payload = frame.into_payload();
         let event = Event::Data(DataEvent {
-            payload: frame.into_payload(),
-            is_budgeted,
+            payload: Bytes::copy_from_slice(&payload),
         });
 
         // Push the frame onto the recv buffer
@@ -963,9 +971,7 @@ impl Recv {
         let mut to_release: WindowSize = 0;
         while let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
             if let Event::Data(data) = &event {
-                if data.is_budgeted {
-                    counts.release_data_frame(data.payload.len());
-                }
+                counts.release_data_frame();
                 to_release = to_release
                     .saturating_add(data.payload.len() as WindowSize)
                     .min(stream.in_flight_recv_data);
@@ -1305,7 +1311,6 @@ mod tests {
                 &mut recv.buffer,
                 Event::Data(DataEvent {
                     payload: data.clone(),
-                    is_budgeted: true,
                 }),
             );
         }

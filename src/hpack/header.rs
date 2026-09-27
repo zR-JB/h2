@@ -66,6 +66,7 @@ impl Header {
             return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream));
         }
         if name[0] == b':' {
+            let value = Bytes::copy_from_slice(&value);
             match &name[1..] {
                 b"authority" => {
                     let value = BytesStr::try_from(value)?;
@@ -228,6 +229,11 @@ impl From<Header> for Header<Option<HeaderName>> {
 
 impl<'a> Name<'a> {
     pub fn into_entry(self, value: Bytes) -> Result<Header, DecoderError> {
+        let value = if matches!(self, Name::Field(_)) {
+            value
+        } else {
+            Bytes::copy_from_slice(&value)
+        };
         match self {
             Name::Field(name) => Ok(Header::Field {
                 name: name.clone(),
