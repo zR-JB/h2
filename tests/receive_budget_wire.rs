@@ -218,3 +218,94 @@ async fn empty_final_data_events_consume_budget() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn tiny_send_events_backpressure_and_refund_with_one_byte_window_updates() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (fill, mut filled) = tokio::sync::oneshot::channel();
+        let (complete, completed) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut builder = h2::server::Builder::new();
+            builder
+                .initial_window_size(8 * 1024 * 1024)
+                .initial_connection_window_size(16 * 1024 * 1024)
+                .max_concurrent_streams(250)
+                .max_header_list_size(32 * 1024)
+                .max_send_buffer_size(16 * 1024);
+            let mut connection = builder.handshake::<_, Bytes>(socket).await.unwrap();
+            let (_, mut reply) = connection.accept().await.unwrap().unwrap();
+            let mut send = reply.send_response(Response::new(()), false).unwrap();
+            send.reserve_capacity(16 * 1024);
+            loop {
+                tokio::select! {
+                    result = connection.accept() => { assert!(result.is_none()); },
+                    _ = &mut filled => break,
+                }
+            }
+            let mut queued = 0;
+            while send.capacity() > 0 && queued < 100 {
+                send.send_data(Bytes::from_static(b"x"), false).unwrap();
+                queued += 1;
+            }
+            assert!(
+                queued > 0 && queued < 100,
+                "metadata must backpressure below the payload watermark"
+            );
+            assert_eq!(send.capacity(), 0);
+            assert!(send.send_data(Bytes::from_static(b"x"), false).is_err());
+            let producer = tokio::spawn(async move {
+                for _ in queued..1024 {
+                    send.reserve_capacity(1);
+                    if send.capacity() == 0 {
+                        std::future::poll_fn(|cx| send.poll_capacity(cx))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    }
+                    send.send_data(Bytes::from_static(b"x"), false).unwrap();
+                }
+                send.send_data(Bytes::new(), true).unwrap();
+                complete.send(()).unwrap();
+            });
+            while connection.accept().await.is_some() {}
+            producer.abort();
+        });
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket.set_nodelay(true).unwrap();
+        socket
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        frame(&mut socket, 4, 0, 0, &[0, 4, 0, 0, 0, 1]).await;
+        frame(&mut socket, 1, 5, 1, b"\x83\x86\x84\x01\x09localhost").await;
+        for _ in 0..100 {
+            frame(&mut socket, 8, 0, 1, &[0, 0, 0, 1]).await;
+        }
+        frame(&mut socket, 6, 0, 0, b"ready!!!").await;
+        loop {
+            let (kind, _, payload) = next(&mut socket).await;
+            if kind == 6 && payload == b"ready!!!" {
+                break;
+            }
+        }
+        fill.send(()).unwrap();
+        let mut received = 0;
+        while received < 1024 {
+            let (kind, stream, payload) = next(&mut socket).await;
+            assert_ne!(kind, 7);
+            if kind == 0 && stream == 1 && !payload.is_empty() {
+                assert_eq!(payload, b"x");
+                received += 1;
+                frame(&mut socket, 8, 0, 1, &[0, 0, 0, 1]).await;
+            }
+        }
+        completed.await.unwrap();
+        server.abort();
+    })
+    .await
+    .unwrap();
+}

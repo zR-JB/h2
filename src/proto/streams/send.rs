@@ -49,12 +49,12 @@ pub(crate) enum PollReset {
 
 impl Send {
     /// Create a new `Send`
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, send_frame_size: usize) -> Self {
         Send {
             init_window_sz: config.remote_init_window_sz,
             max_stream_id: StreamId::MAX,
             next_stream_id: Ok(config.local_next_stream_id),
-            prioritize: Prioritize::new(config),
+            prioritize: Prioritize::new(config, send_frame_size),
             is_push_enabled: true,
             is_extended_connect_protocol_enabled: false,
         }
@@ -362,12 +362,14 @@ impl Send {
         &mut self,
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
+        counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> bool
     where
         B: Buf,
     {
-        self.prioritize.reclaim_written_frame(buffer, store, dst)
+        self.prioritize
+            .reclaim_written_frame(buffer, store, counts, dst)
     }
 
     /// Request capacity to send data
@@ -410,7 +412,10 @@ impl Send {
 
     /// Current available stream send capacity
     pub fn capacity(&self, stream: &mut store::Ptr) -> WindowSize {
-        stream.capacity(self.prioritize.max_buffer_size())
+        stream.capacity(
+            self.prioritize.max_buffer_size(),
+            self.prioritize.max_buffered_data_frames(),
+        )
     }
 
     pub fn poll_reset(

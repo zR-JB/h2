@@ -26,6 +26,11 @@ struct Slot<T> {
 }
 
 impl<T> Buffer<T> {
+    pub fn slot_size() -> usize {
+        // Include the slab's occupied/free discriminant.
+        std::mem::size_of::<(usize, Slot<T>)>()
+    }
+
     pub fn new() -> Self {
         Buffer { slab: Slab::new() }
     }

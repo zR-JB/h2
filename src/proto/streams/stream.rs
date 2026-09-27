@@ -47,6 +47,7 @@ pub(super) struct Stream {
     /// Amount of data buffered at the prioritization layer.
     /// TODO: Technically this could be greater than the window size...
     pub buffered_send_data: usize,
+    pub buffered_send_frames: usize,
 
     /// Task tracking additional send capacity (i.e. window updates).
     send_task: Option<Waker>,
@@ -170,6 +171,7 @@ impl Stream {
             send_flow,
             requested_send_capacity: 0,
             buffered_send_data: 0,
+            buffered_send_frames: 0,
             send_task: None,
             pending_send: buffer::Deque::new(),
             is_pending_send_capacity: false,
@@ -247,7 +249,7 @@ impl Stream {
             // queue to be rescheduled.
             //
             // Checking for additional buffered data lets us catch this case.
-            self.buffered_send_data == 0
+            self.buffered_send_data == 0 && self.buffered_send_frames == 0
     }
 
     /// Returns true if the stream is no longer in use
@@ -272,15 +274,23 @@ impl Stream {
     }
 
     /// Current available stream send capacity
-    pub fn capacity(&self, max_buffer_size: usize) -> WindowSize {
+    pub fn capacity(&self, max_buffer_size: usize, max_buffered_frames: usize) -> WindowSize {
+        if self.buffered_send_frames >= max_buffered_frames {
+            return 0;
+        }
         let available = self.send_flow.available().as_size() as usize;
         let buffered = self.buffered_send_data;
 
         available.min(max_buffer_size).saturating_sub(buffered) as WindowSize
     }
 
-    pub fn assign_capacity(&mut self, capacity: WindowSize, max_buffer_size: usize) {
-        let prev_capacity = self.capacity(max_buffer_size);
+    pub fn assign_capacity(
+        &mut self,
+        capacity: WindowSize,
+        max_buffer_size: usize,
+        max_buffered_frames: usize,
+    ) {
+        let prev_capacity = self.capacity(max_buffer_size, max_buffered_frames);
         debug_assert!(capacity > 0);
         // TODO: proper error handling
         let _res = self.send_flow.assign_capacity(capacity);
@@ -295,13 +305,18 @@ impl Stream {
             prev_capacity,
         );
 
-        if prev_capacity < self.capacity(max_buffer_size) {
+        if prev_capacity < self.capacity(max_buffer_size, max_buffered_frames) {
             self.notify_capacity();
         }
     }
 
-    pub fn send_data(&mut self, len: WindowSize, max_buffer_size: usize) {
-        let prev_capacity = self.capacity(max_buffer_size);
+    pub fn send_data(
+        &mut self,
+        len: WindowSize,
+        max_buffer_size: usize,
+        max_buffered_frames: usize,
+    ) {
+        let prev_capacity = self.capacity(max_buffer_size, max_buffered_frames);
 
         // TODO: proper error handling
         let _res = self.send_flow.send_data(len);
@@ -321,7 +336,7 @@ impl Stream {
             prev_capacity,
         );
 
-        if prev_capacity < self.capacity(max_buffer_size) {
+        if prev_capacity < self.capacity(max_buffer_size, max_buffered_frames) {
             self.notify_capacity();
         }
     }

@@ -14,7 +14,8 @@ use std::io::{self, Cursor};
 // A macro to get around a method needing to borrow &mut self
 macro_rules! limited_write_buf {
     ($self:expr) => {{
-        let limit = $self.max_frame_size() + frame::HEADER_LEN;
+        let room = DEFAULT_BUFFER_CAPACITY - $self.buf.get_ref().len();
+        let limit = ($self.max_frame_size() + frame::HEADER_LEN).min(room);
         $self.buf.get_mut().limit(limit)
     }};
 }
@@ -308,8 +309,7 @@ where
 
     fn has_capacity(&self) -> bool {
         self.next.is_none()
-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
-                >= self.min_buffer_capacity)
+            && (DEFAULT_BUFFER_CAPACITY - self.buf.get_ref().len() >= self.min_buffer_capacity)
     }
 
     fn is_empty(&self) -> bool {
@@ -374,5 +374,61 @@ mod unstable {
         pub fn get_ref(&self) -> &T {
             &self.inner
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use http::{HeaderMap, HeaderValue, Request, StatusCode};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn large_headers_fragment_without_growing_the_write_buffer() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (start, started) = tokio::sync::oneshot::channel();
+            let value = HeaderValue::from_str(&"a".repeat(26_196)).unwrap();
+            let expected = value.clone();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut writer = FramedWrite::<_, Bytes>::new(socket);
+                writer.set_max_frame_size(frame::MAX_MAX_FRAME_SIZE as usize);
+                started.await.unwrap();
+                writer.buffer(frame::Settings::default().into()).unwrap();
+                let mut fields = HeaderMap::new();
+                fields.insert("x-pad", value);
+                let mut headers =
+                    frame::Headers::new(1.into(), frame::Pseudo::response(StatusCode::OK), fields);
+                headers.set_end_stream();
+                writer.buffer(headers.into()).unwrap();
+                assert_eq!(
+                    writer.encoder.buf.get_ref().capacity(),
+                    DEFAULT_BUFFER_CAPACITY
+                );
+                assert!(!writer.has_capacity());
+                std::future::poll_fn(|cx| writer.flush(cx)).await.unwrap();
+                assert_eq!(
+                    writer.encoder.buf.get_ref().capacity(),
+                    DEFAULT_BUFFER_CAPACITY
+                );
+            });
+            let socket = TcpStream::connect(address).await.unwrap();
+            let (mut sender, connection) = crate::client::Builder::new()
+                .max_frame_size(frame::MAX_MAX_FRAME_SIZE)
+                .handshake::<_, Bytes>(socket)
+                .await
+                .unwrap();
+            let driver = tokio::spawn(connection);
+            let (response, _) = sender.send_request(Request::new(()), true).unwrap();
+            start.send(()).unwrap();
+            assert_eq!(response.await.unwrap().headers()["x-pad"], expected);
+            server.await.unwrap();
+            driver.abort();
+        })
+        .await
+        .unwrap();
     }
 }
