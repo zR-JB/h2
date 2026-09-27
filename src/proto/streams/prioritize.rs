@@ -183,14 +183,11 @@ impl Prioritize {
             }
         }
 
-        if stream.buffered_send_frames >= self.max_buffered_data_frames
-            && !(sz == 0 && frame.is_end_stream())
-        {
-            return Err(UserError::SendBufferFull);
-        }
-        if !stream
-            .send_charge
-            .try_add(&self.state_budget, counts.send_frame_bytes())
+        if !(sz == 0 && frame.is_end_stream())
+            && (stream.buffered_send_frames >= self.max_buffered_data_frames
+                || !stream
+                    .send_charge
+                    .try_add(&self.state_budget, counts.send_frame_bytes()))
         {
             return Err(UserError::SendBufferFull);
         }
