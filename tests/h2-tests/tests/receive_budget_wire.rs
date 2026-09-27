@@ -500,6 +500,7 @@ async fn until_reset(socket: &mut TcpStream, id: u32) -> h2::Reason {
     loop {
         let (kind, stream, payload) = next(socket).await;
         assert_ne!(kind, 7, "a refused charge must remain stream-local");
+        assert!(!(kind == 1 && stream == id), "a refusal must not answer");
         if kind == 3 && stream == id {
             return u32::from_be_bytes(payload.try_into().unwrap()).into();
         }
@@ -562,19 +563,24 @@ async fn header_and_data_floods_stay_within_the_connection_allowance() {
         let refused = loop {
             frame(&mut socket, 1, 4, id, &head(false)).await;
             frame(&mut socket, 6, 0, 0, b"accepted").await;
+            let mut replies = Vec::new();
             loop {
                 let (kind, stream, payload) = next(&mut socket).await;
                 assert_ne!(kind, 7);
                 if kind == 6 && payload == b"accepted" {
                     break;
                 }
-                if kind == 3 && stream == id {
-                    assert_eq!(payload, u32::from(h2::Reason::PROTOCOL_ERROR).to_be_bytes());
+                if stream == id {
+                    replies.push((kind, payload));
                 }
             }
             match observed.try_recv() {
                 Ok((stream, _)) => assert_eq!(stream, id),
-                Err(_) => break id,
+                Err(_) => {
+                    let refusal = u32::from(h2::Reason::REFUSED_STREAM).to_be_bytes();
+                    assert_eq!(replies, [(3, refusal.to_vec())], "pressure is retryable");
+                    break id;
+                }
             }
             id += 2;
         };
@@ -584,15 +590,38 @@ async fn header_and_data_floods_stay_within_the_connection_allowance() {
         }
         assert_eq!(until_reset(&mut socket, 1).await, h2::Reason::ENHANCE_YOUR_CALM);
         frame(&mut socket, 1, 4, refused + 2, &head(true)).await;
-        assert_eq!(until_reset(&mut socket, refused + 2).await, h2::Reason::PROTOCOL_ERROR);
+        assert_eq!(until_reset(&mut socket, refused + 2).await, h2::Reason::REFUSED_STREAM);
+        frame(&mut socket, 1, 5, 5, b"\x00\x02xa\x01v").await;
+        assert_eq!(until_reset(&mut socket, 5).await, h2::Reason::ENHANCE_YOUR_CALM);
+        let mut oversize = b"\x82\x87\x84\x01\x09localhost".to_vec();
+        for _ in 0..40 {
+            oversize.extend_from_slice(b"\x00\x02xa\x7f\xe9\x06");
+            oversize.extend_from_slice(&[b'v'; 1000]);
+        }
+        for (i, block) in oversize.chunks(16 * 1024).enumerate() {
+            let last = (i + 1) * 16 * 1024 >= oversize.len();
+            let kind = if i == 0 { 1 } else { 9 };
+            frame(&mut socket, kind, if last { 4 } else { 0 }, refused + 4, block).await;
+        }
+        let mut answered = false;
+        let reset = loop {
+            let (kind, stream, payload) = next(&mut socket).await;
+            assert_ne!(kind, 7);
+            answered |= kind == 1 && stream == refused + 4;
+            if kind == 3 && stream == refused + 4 {
+                break payload;
+            }
+        };
+        assert!(answered, "oversize headers keep their 431 under pressure");
+        assert_eq!(reset, u32::from(h2::Reason::PROTOCOL_ERROR).to_be_bytes());
         assert_eq!(meter.peak.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let (done, cleared) = tokio::sync::oneshot::channel();
         clear.send(done).await.unwrap();
         cleared.await.unwrap();
-        frame(&mut socket, 1, 5, refused + 4, b"\x82\x87\x84\x01\x09localhost\xbe").await;
+        frame(&mut socket, 1, 5, refused + 6, b"\x82\x87\x84\x01\x09localhost\xbe").await;
         let (stream, sync) = observed.recv().await.unwrap();
-        assert_eq!(stream, refused + 4);
+        assert_eq!(stream, refused + 6);
         assert_eq!(sync.unwrap(), "v");
         drop(socket);
         task.await.unwrap();

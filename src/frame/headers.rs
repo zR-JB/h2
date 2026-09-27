@@ -101,6 +101,8 @@ struct HeaderBlock {
     /// Set to true if decoding went over the max header list size.
     is_over_size: bool,
 
+    is_refused: bool,
+
     /// Pseudo headers, these are broken out as they must be sent as part of the
     /// headers frame.
     pseudo: Pseudo,
@@ -131,6 +133,7 @@ impl Headers {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                is_refused: false,
                 pseudo,
                 charge: Charge::default(),
             },
@@ -149,6 +152,7 @@ impl Headers {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                is_refused: false,
                 pseudo: Pseudo::default(),
                 charge: Charge::default(),
             },
@@ -215,6 +219,7 @@ impl Headers {
                 fields: HeaderMap::new(),
                 field_size: 0,
                 is_over_size: false,
+                is_refused: false,
                 pseudo: Pseudo::default(),
                 charge: Charge::default(),
             },
@@ -255,6 +260,10 @@ impl Headers {
 
     pub fn is_over_size(&self) -> bool {
         self.header_block.is_over_size
+    }
+
+    pub(crate) fn is_refused(&self) -> bool {
+        self.header_block.is_refused
     }
 
     pub(crate) fn take_charge(&mut self) -> Charge {
@@ -389,6 +398,7 @@ impl PushPromise {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                is_refused: false,
                 pseudo,
                 charge: Charge::default(),
             },
@@ -481,6 +491,7 @@ impl PushPromise {
                 fields: HeaderMap::new(),
                 field_size: 0,
                 is_over_size: false,
+                is_refused: false,
                 pseudo: Pseudo::default(),
                 charge: Charge::default(),
             },
@@ -903,8 +914,11 @@ impl HeaderBlock {
         let max_header_list_abuse_size =
             max_header_list_size.saturating_mul(MAX_HEADER_LIST_ABUSE_MULTIPLIER);
         let budget = decoder.budget().clone();
-        if self.charge.bytes() == 0 && !self.charge.try_add(&budget, BLOCK_BYTES) {
-            self.is_over_size = true;
+        if !self.is_over_size
+            && self.charge.bytes() == 0
+            && !self.charge.try_add(&budget, BLOCK_BYTES)
+        {
+            self.is_refused = true;
         }
 
         macro_rules! check_size {
@@ -917,6 +931,7 @@ impl HeaderBlock {
                     if headers_size >= max_header_list_size && !self.is_over_size {
                         tracing::trace!("load_hpack; header list size over max");
                         self.is_over_size = true;
+                        self.is_refused = false;
                     }
                     ControlFlow::Continue(())
                 }
@@ -938,11 +953,11 @@ impl HeaderBlock {
                     if check_size!().is_break() {
                         return ControlFlow::Break(());
                     }
-                    if !self.is_over_size {
+                    if !self.is_over_size && !self.is_refused {
                         if self.charge.try_add(&budget, __len + PROMOTED_BYTES) {
                             self.pseudo.$field = Some(__val);
                         } else {
-                            self.is_over_size = true;
+                            self.is_refused = true;
                             self.fields = HeaderMap::new();
                         }
                     }
@@ -988,16 +1003,20 @@ impl HeaderBlock {
                         }
                         if !self.is_over_size {
                             self.field_size += header_size;
+                        }
+                        if !self.is_over_size && !self.is_refused {
                             let before = map_bytes(&self.fields);
                             let owned = field_bytes(&name, &value);
                             if self.fields.try_append(name, value).is_err()
                                 || self.fields.capacity() > max_field_capacity
-                                || !self
-                                    .charge
-                                    .try_add(&budget, map_bytes(&self.fields) - before + owned)
                             {
-                                // Finish HPACK synchronization without retaining excess metadata.
                                 self.is_over_size = true;
+                            } else {
+                                let bytes = map_bytes(&self.fields) - before + owned;
+                                self.is_refused = !self.charge.try_add(&budget, bytes);
+                            }
+                            if self.is_over_size || self.is_refused {
+                                // Finish HPACK synchronization without retaining excess metadata.
                                 self.fields = HeaderMap::new();
                             }
                         }

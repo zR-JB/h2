@@ -509,11 +509,12 @@ impl Inner {
                     }
                 }
 
-                match self
-                    .actions
-                    .recv
-                    .open(id, Open::Headers, &mut self.counts)?
-                {
+                match self.actions.recv.open(
+                    id,
+                    Open::Headers,
+                    frame.is_refused(),
+                    &mut self.counts,
+                )? {
                     Some(stream_id) => {
                         let stream = Stream::new(
                             stream_id,
@@ -869,7 +870,7 @@ impl Inner {
         if self
             .actions
             .recv
-            .open(promised_id, Open::PushPromise, &mut self.counts)?
+            .open(promised_id, Open::PushPromise, false, &mut self.counts)?
             .is_none()
         {
             return Ok(RecvOutcome::Refused(promised_id));
