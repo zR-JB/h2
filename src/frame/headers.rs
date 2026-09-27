@@ -869,6 +869,13 @@ impl HeaderBlock {
         let mut malformed = false;
         let mut header_list_way_too_large = false;
         let mut headers_size = self.calculate_header_list_size();
+        let max_fields = max_header_list_size.saturating_sub(1) / decoded_header_size(1, 0);
+        let raw_capacity = max_fields
+            .saturating_add(max_fields / 3)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(8);
+        let max_field_capacity = raw_capacity - raw_capacity / 4;
         let max_header_list_abuse_size =
             max_header_list_size.saturating_mul(MAX_HEADER_LIST_ABUSE_MULTIPLIER);
 
@@ -948,11 +955,12 @@ impl HeaderBlock {
                         }
                         if !self.is_over_size {
                             self.field_size += header_size;
-                            if self.fields.try_append(name, value).is_err() {
-                                // HeaderMap capacity exceeded — treat as over-size
-                                // so the stream is rejected downstream (RST_STREAM / 431)
-                                // instead of panicking on the 24,577th unique header.
+                            if self.fields.try_append(name, value).is_err()
+                                || self.fields.capacity() > max_field_capacity
+                            {
+                                // Finish HPACK synchronization without retaining excess metadata.
                                 self.is_over_size = true;
+                                self.fields = HeaderMap::new();
                             }
                         }
                     }
