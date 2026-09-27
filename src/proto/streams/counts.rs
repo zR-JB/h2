@@ -288,7 +288,7 @@ impl Counts {
 
             if !stream.state.is_scheduled_reset()
                 && stream.is_counted
-                && stream.pending_recv.is_empty()
+                && (!self.peer.is_server() || stream.pending_recv.is_empty())
             {
                 tracing::trace!("dec_num_streams; stream={:?}", stream.id);
                 // Decrement the number of active streams.

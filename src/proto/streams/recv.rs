@@ -1125,7 +1125,9 @@ impl Recv {
 
     fn clear_all_pending_accept(&mut self, store: &mut Store, counts: &mut Counts) {
         while let Some(stream) = self.pending_accept.pop(store) {
-            counts.transition_after(stream, false);
+            counts.transition(stream, |counts, stream| {
+                self.clear_recv_buffer(stream, &mut None, counts);
+            });
         }
     }
 
