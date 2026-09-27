@@ -140,6 +140,7 @@ impl Recv {
         &mut self,
         id: StreamId,
         mode: Open,
+        refuse: bool,
         counts: &mut Counts,
     ) -> Result<Option<StreamId>, Error> {
         assert!(self.refused.is_none());
@@ -154,7 +155,7 @@ impl Recv {
 
         self.next_stream_id = id.next_id();
 
-        if !counts.can_inc_num_recv_streams() {
+        if refuse || !counts.can_inc_num_recv_streams() {
             self.refused = Some(id);
             return Ok(None);
         }
@@ -430,6 +431,9 @@ impl Recv {
     ) -> Result<(), Error> {
         if frame.is_over_size() {
             return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+        }
+        if frame.is_refused() {
+            return Err(Error::library_reset(stream.id, Reason::ENHANCE_YOUR_CALM));
         }
 
         // Transition the state
