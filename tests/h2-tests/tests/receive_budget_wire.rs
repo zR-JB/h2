@@ -516,7 +516,8 @@ async fn header_and_data_floods_stay_within_the_connection_allowance() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (accepted, mut observed) = tokio::sync::mpsc::channel(64);
-        let (clear, mut clears) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>(1);
+        let (clear, mut clears) =
+            tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<bool>>(1);
         let task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut builder = h2::server::Builder::new();
@@ -527,17 +528,22 @@ async fn header_and_data_floods_stay_within_the_connection_allowance() {
                 .shared_budget(budget, CAP);
             let mut connection = builder.handshake::<_, Bytes>(socket).await.unwrap();
             let mut held = Vec::new();
+            let mut response = None;
             loop {
                 tokio::select! {
                     result = connection.accept() => {
-                        let (request, reply) = match result { Some(Ok(accepted)) => accepted, _ => break };
-                        let sync = request.headers().get("x-sync").cloned();
-                        accepted.send((request.body().stream_id().as_u32(), sync)).await.unwrap();
+                        let (request, mut reply) = match result { Some(Ok(accepted)) => accepted, _ => break };
+                        let id = request.body().stream_id().as_u32();
+                        accepted.send((id, request.headers().get("x-sync").cloned())).await.unwrap();
+                        if id == 3 {
+                            response = Some(reply.send_response(Response::new(()), false).unwrap());
+                        }
                         held.push((request, reply));
                     }
                     Some(done) = clears.recv() => {
+                        let finished = response.take().unwrap().send_data(Bytes::new(), true);
                         held.clear();
-                        done.send(()).unwrap();
+                        done.send(finished.is_ok()).unwrap();
                     }
                 }
             }
@@ -618,7 +624,8 @@ async fn header_and_data_floods_stay_within_the_connection_allowance() {
 
         let (done, cleared) = tokio::sync::oneshot::channel();
         clear.send(done).await.unwrap();
-        cleared.await.unwrap();
+        assert!(cleared.await.unwrap(), "an empty final frame needs no allowance");
+        while next(&mut socket).await != (0, 3, Vec::new()) {}
         frame(&mut socket, 1, 5, refused + 6, b"\x82\x87\x84\x01\x09localhost\xbe").await;
         let (stream, sync) = observed.recv().await.unwrap();
         assert_eq!(stream, refused + 6);
