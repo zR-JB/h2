@@ -81,6 +81,8 @@ pub struct Config {
 
     /// Connection-level budget policy for DATA framing overhead.
     pub(crate) data_frame_budget: DataFrameBudget,
+    pub shared_budget: crate::budget::Budget,
+    pub state_budget: crate::budget::Budget,
 }
 
 trait DebugStructExt<'a, 'b> {

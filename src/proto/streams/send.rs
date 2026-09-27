@@ -65,6 +65,10 @@ impl Send {
         self.init_window_sz
     }
 
+    pub(crate) fn state_budget(&self) -> &crate::budget::Budget {
+        self.prioritize.state_budget()
+    }
+
     pub fn open(&mut self) -> Result<StreamId, UserError> {
         let stream_id = self.ensure_next_stream_id()?;
         self.next_stream_id = stream_id.next_id();

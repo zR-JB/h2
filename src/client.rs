@@ -1367,6 +1367,8 @@ where
                 local_error_reset_streams_max: builder.local_max_error_reset_streams,
                 settings: builder.settings,
                 data_frame_budget: builder.data_frame_budget,
+                shared_budget: None,
+                max_state: 0,
             },
         );
         let send_request = SendRequest {

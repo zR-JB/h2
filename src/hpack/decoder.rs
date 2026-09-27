@@ -1,4 +1,5 @@
 use super::{header::BytesStr, huffman, Header};
+use crate::budget::Budget;
 use crate::frame;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -20,6 +21,7 @@ pub struct Decoder {
     last_max_update: usize,
     table: Table,
     buffer: BytesMut,
+    budget: Budget,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -159,7 +161,16 @@ impl Decoder {
             last_max_update: size,
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
+            budget: None,
         }
+    }
+
+    pub(crate) fn budget(&self) -> &Budget {
+        &self.budget
+    }
+
+    pub(crate) fn set_budget(&mut self, budget: Budget) {
+        self.budget = budget;
     }
 
     /// Queues a potential size update

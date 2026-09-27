@@ -1,4 +1,5 @@
 use super::{util, StreamDependency, StreamId};
+use crate::budget::{Budget, Charge};
 use crate::ext::Protocol;
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
@@ -15,6 +16,9 @@ use std::ops::ControlFlow;
 type EncodeBuf<'a> = bytes::buf::Limit<&'a mut BytesMut>;
 
 const MAX_HEADER_LIST_ABUSE_MULTIPLIER: usize = 4;
+// Stream state (384 B), its event slot with the request parts (256 B) and index.
+const BLOCK_BYTES: usize = 1024;
+const PROMOTED_BYTES: usize = 24;
 
 /// Header frame
 ///
@@ -100,6 +104,8 @@ struct HeaderBlock {
     /// Pseudo headers, these are broken out as they must be sent as part of the
     /// headers frame.
     pseudo: Pseudo,
+
+    charge: Charge,
 }
 
 #[derive(Debug)]
@@ -126,6 +132,7 @@ impl Headers {
                 fields,
                 is_over_size: false,
                 pseudo,
+                charge: Charge::default(),
             },
             flags: HeadersFlag::default(),
         }
@@ -143,6 +150,7 @@ impl Headers {
                 fields,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                charge: Charge::default(),
             },
             flags,
         }
@@ -208,6 +216,7 @@ impl Headers {
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                charge: Charge::default(),
             },
             flags,
         };
@@ -246,6 +255,19 @@ impl Headers {
 
     pub fn is_over_size(&self) -> bool {
         self.header_block.is_over_size
+    }
+
+    pub(crate) fn take_charge(&mut self) -> Charge {
+        std::mem::take(&mut self.header_block.charge)
+    }
+
+    pub(crate) fn try_charge(&mut self, budget: &Budget) -> bool {
+        let block = &mut self.header_block;
+        let fields = block.fields.iter();
+        let bytes = BLOCK_BYTES
+            + map_bytes(&block.fields)
+            + fields.map(|(n, v)| field_bytes(n, v)).sum::<usize>();
+        block.charge.try_add(budget, bytes)
     }
 
     pub fn into_parts(self) -> (Pseudo, HeaderMap) {
@@ -368,6 +390,7 @@ impl PushPromise {
                 fields,
                 is_over_size: false,
                 pseudo,
+                charge: Charge::default(),
             },
             promised_id,
             stream_id,
@@ -459,6 +482,7 @@ impl PushPromise {
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                charge: Charge::default(),
             },
             promised_id,
             stream_id: head.stream_id(),
@@ -878,6 +902,10 @@ impl HeaderBlock {
         let max_field_capacity = raw_capacity - raw_capacity / 4;
         let max_header_list_abuse_size =
             max_header_list_size.saturating_mul(MAX_HEADER_LIST_ABUSE_MULTIPLIER);
+        let budget = decoder.budget().clone();
+        if self.charge.bytes() == 0 && !self.charge.try_add(&budget, BLOCK_BYTES) {
+            self.is_over_size = true;
+        }
 
         macro_rules! check_size {
             () => {{
@@ -905,13 +933,18 @@ impl HeaderBlock {
                     malformed = true;
                 } else {
                     let __val = $val;
-                    headers_size +=
-                        decoded_header_size(stringify!($field).len() + 1, __val.as_str().len());
+                    let __len = __val.as_str().len();
+                    headers_size += decoded_header_size(stringify!($field).len() + 1, __len);
                     if check_size!().is_break() {
                         return ControlFlow::Break(());
                     }
                     if !self.is_over_size {
-                        self.pseudo.$field = Some(__val);
+                        if self.charge.try_add(&budget, __len + PROMOTED_BYTES) {
+                            self.pseudo.$field = Some(__val);
+                        } else {
+                            self.is_over_size = true;
+                            self.fields = HeaderMap::new();
+                        }
                     }
                 }
             }};
@@ -955,8 +988,13 @@ impl HeaderBlock {
                         }
                         if !self.is_over_size {
                             self.field_size += header_size;
+                            let before = map_bytes(&self.fields);
+                            let owned = field_bytes(&name, &value);
                             if self.fields.try_append(name, value).is_err()
                                 || self.fields.capacity() > max_field_capacity
+                                || !self
+                                    .charge
+                                    .try_add(&budget, map_bytes(&self.fields) - before + owned)
                             {
                                 // Finish HPACK synchronization without retaining excess metadata.
                                 self.is_over_size = true;
@@ -1045,6 +1083,20 @@ fn calculate_headermap_size(map: &HeaderMap) -> usize {
 
 fn decoded_header_size(name: usize, value: usize) -> usize {
     name + value + 32
+}
+
+fn field_bytes(name: &HeaderName, value: &HeaderValue) -> usize {
+    name.as_str().len() + value.len() + 2 * PROMOTED_BYTES
+}
+
+fn map_bytes(map: &HeaderMap) -> usize {
+    let entry = std::mem::size_of::<HeaderName>() + std::mem::size_of::<HeaderValue>() + 32;
+    let extra = match map.len() - map.keys_len() {
+        0 => 0,
+        extra => extra.next_power_of_two().max(4),
+    };
+    // The index table holds 4/3 slots of four bytes per usable entry.
+    map.capacity() * (entry + 6) + extra * (std::mem::size_of::<HeaderValue>() + 32)
 }
 
 #[cfg(test)]
