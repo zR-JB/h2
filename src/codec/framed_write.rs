@@ -348,6 +348,12 @@ impl<T, B> FramedWrite<T, B> {
         self.encoder.last_data_frame.take()
     }
 
+    pub fn discard_pending_data(&mut self) {
+        if let Some(Next::Data(frame)) = self.encoder.next.take() {
+            self.encoder.last_data_frame = Some(frame);
+        }
+    }
+
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.inner
     }

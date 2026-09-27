@@ -658,6 +658,7 @@ where
 {
     fn drop(&mut self) {
         // Ignore errors as this indicates that the mutex is poisoned.
+        self.inner.streams.discard_pending_data(&mut self.codec);
         let _ = self.inner.streams.recv_eof(true);
     }
 }

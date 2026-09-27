@@ -1101,6 +1101,16 @@ where
         self.as_dyn().recv_eof(clear_pending_accept)
     }
 
+    pub fn discard_pending_data<T>(&mut self, dst: &mut Codec<T, Prioritized<B>>)
+    where
+        B: Buf,
+    {
+        dst.discard_pending_data();
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.reclaim_written_frame(&self.send_buffer, dst);
+        }
+    }
+
     pub(crate) fn max_send_streams(&self) -> usize {
         self.inner.lock().unwrap().counts.max_send_streams()
     }

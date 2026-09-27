@@ -285,7 +285,7 @@ async fn too_many_small_data_frames_sends_goaway() {
 }
 
 #[tokio::test]
-async fn many_small_final_data_frames_do_not_exhaust_budget() {
+async fn consumed_small_final_data_frames_reuse_budget() {
     h2_support::trace_init!();
 
     const NUM_STREAMS: u32 = 200;
@@ -318,7 +318,11 @@ async fn many_small_final_data_frames_do_not_exhaust_budget() {
     };
 
     let h2 = async move {
-        let (mut client, h2) = client::handshake(io).await.unwrap();
+        let (mut client, h2) = client::Builder::new()
+            .data_frame_budget(NUM_STREAMS as usize * 256)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
 
         let requests = async move {
             let mut responses = Vec::new();
@@ -331,13 +335,11 @@ async fn many_small_final_data_frames_do_not_exhaust_budget() {
                 responses.push(client.send_request(request, true).unwrap().0);
             }
 
-            // Wait for every response without polling any response body. This
-            // ensures all final DATA frames can be buffered concurrently.
-            let mut received = Vec::new();
             for response in responses {
-                received.push(response.await.unwrap());
+                let mut body = response.await.unwrap().into_body();
+                assert_eq!(body.data().await.unwrap().unwrap(), "a");
+                assert!(body.data().await.is_none());
             }
-            assert_eq!(received.len(), NUM_STREAMS as usize);
             done_tx.send(()).unwrap();
         };
 
