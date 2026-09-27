@@ -453,3 +453,231 @@ async fn header_metadata_refusal_preserves_ordinary_fields_and_hpack_siblings() 
     .await
     .unwrap();
 }
+
+#[derive(Debug)]
+struct Meter {
+    limit: usize,
+    used: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+impl Meter {
+    fn new(limit: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Meter {
+            limit,
+            used: Default::default(),
+            peak: Default::default(),
+        })
+    }
+
+    fn used(&self) -> usize {
+        self.used.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl h2::SharedBudget for Meter {
+    fn try_charge(&self, bytes: usize) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let limit = self.limit;
+        match self.used.fetch_update(SeqCst, SeqCst, |used| {
+            Some(used + bytes).filter(|used| *used <= limit)
+        }) {
+            Ok(used) => {
+                self.peak.fetch_max(used + bytes, SeqCst);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn refund(&self, bytes: usize) {
+        self.used
+            .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn until_reset(socket: &mut TcpStream, id: u32) -> h2::Reason {
+    loop {
+        let (kind, stream, payload) = next(socket).await;
+        assert_ne!(kind, 7, "a refused charge must remain stream-local");
+        if kind == 3 && stream == id {
+            return u32::from_be_bytes(payload.try_into().unwrap()).into();
+        }
+    }
+}
+
+#[tokio::test]
+async fn header_and_data_floods_stay_within_the_connection_allowance() {
+    const CAP: usize = 64 * 1024;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let meter = Meter::new(usize::MAX);
+        let budget = meter.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted, mut observed) = tokio::sync::mpsc::channel(64);
+        let (clear, mut clears) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>(1);
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut builder = h2::server::Builder::new();
+            builder
+                .max_concurrent_streams(250)
+                .max_header_list_size(32 * 1024)
+                .data_frame_budget(1 << 20)
+                .shared_budget(budget, CAP);
+            let mut connection = builder.handshake::<_, Bytes>(socket).await.unwrap();
+            let mut held = Vec::new();
+            loop {
+                tokio::select! {
+                    result = connection.accept() => {
+                        let (request, reply) = match result { Some(Ok(accepted)) => accepted, _ => break };
+                        let sync = request.headers().get("x-sync").cloned();
+                        accepted.send((request.body().stream_id().as_u32(), sync)).await.unwrap();
+                        held.push((request, reply));
+                    }
+                    Some(done) = clears.recv() => {
+                        held.clear();
+                        done.send(()).unwrap();
+                    }
+                }
+            }
+        });
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        frame(&mut socket, 4, 0, 0, &[]).await;
+        let head = |sync: bool| {
+            let mut block = b"\x82\x87\x84\x01\x09localhost".to_vec();
+            for i in 0..20u8 {
+                block.extend_from_slice(&[0, 2, b'x', b'a' + i, 16]);
+                block.extend_from_slice(&[b'v'; 16]);
+            }
+            if sync {
+                block.extend_from_slice(b"\x40\x06x-sync\x01v");
+            }
+            block
+        };
+        let mut id = 1;
+        let refused = loop {
+            frame(&mut socket, 1, 4, id, &head(false)).await;
+            frame(&mut socket, 6, 0, 0, b"accepted").await;
+            loop {
+                let (kind, stream, payload) = next(&mut socket).await;
+                assert_ne!(kind, 7);
+                if kind == 6 && payload == b"accepted" {
+                    break;
+                }
+                if kind == 3 && stream == id {
+                    assert_eq!(payload, u32::from(h2::Reason::PROTOCOL_ERROR).to_be_bytes());
+                }
+            }
+            match observed.try_recv() {
+                Ok((stream, _)) => assert_eq!(stream, id),
+                Err(_) => break id,
+            }
+            id += 2;
+        };
+        assert!(refused > 5, "ordinary requests must fit the cap");
+        for _ in 0..CAP {
+            frame(&mut socket, 0, 0, 1, b"x").await;
+        }
+        assert_eq!(until_reset(&mut socket, 1).await, h2::Reason::ENHANCE_YOUR_CALM);
+        frame(&mut socket, 1, 4, refused + 2, &head(true)).await;
+        assert_eq!(until_reset(&mut socket, refused + 2).await, h2::Reason::PROTOCOL_ERROR);
+        assert_eq!(meter.peak.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let (done, cleared) = tokio::sync::oneshot::channel();
+        clear.send(done).await.unwrap();
+        cleared.await.unwrap();
+        frame(&mut socket, 1, 5, refused + 4, b"\x82\x87\x84\x01\x09localhost\xbe").await;
+        let (stream, sync) = observed.recv().await.unwrap();
+        assert_eq!(stream, refused + 4);
+        assert_eq!(sync.unwrap(), "v");
+        drop(socket);
+        task.await.unwrap();
+        assert_eq!(meter.used(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn receive_window_growth_is_funded_and_refunded_as_peer_credit_drains() {
+    const GROWTH: usize = 128 * 1024;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let meter = Meter::new(1 << 20);
+        let budget = meter.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (report, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut builder = h2::server::Builder::new();
+            builder
+                .initial_window_size(1 << 20)
+                .shared_budget(budget.clone(), 64 * 1024);
+            let mut connection = builder.handshake::<_, Bytes>(socket).await.unwrap();
+            let (request, _reply) = connection.accept().await.unwrap().unwrap();
+            let reader = tokio::spawn(async move {
+                let mut body = request.into_body();
+                let base = budget.used();
+                let flow = body.flow_control();
+                assert!(!flow.set_target_connection_window_size(65_536 + (1 << 20)));
+                assert!(flow.set_target_connection_window_size((65_535 + GROWTH) as u32));
+                assert_eq!(budget.used(), base + GROWTH);
+                let first = body.data().await.unwrap().unwrap();
+                assert!(body
+                    .flow_control()
+                    .set_target_connection_window_size(65_535));
+                body.flow_control().release_capacity(first.len()).unwrap();
+                report.send(budget.used() - base).unwrap();
+                while let Some(data) = body.data().await {
+                    body.flow_control()
+                        .release_capacity(data.unwrap().len())
+                        .unwrap();
+                }
+                report.send(budget.used() - base).unwrap();
+            });
+            while connection.accept().await.is_some() {}
+            reader.await.unwrap();
+        });
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        frame(&mut socket, 4, 0, 0, &[]).await;
+        frame(&mut socket, 4, 1, 0, &[]).await;
+        frame(&mut socket, 1, 4, 1, b"\x83\x86\x84\x01\x09localhost").await;
+        loop {
+            let (kind, stream, payload) = next(&mut socket).await;
+            if kind == 8 && stream == 0 {
+                assert_eq!(
+                    u32::from_be_bytes(payload.try_into().unwrap()) as usize,
+                    GROWTH
+                );
+                break;
+            }
+        }
+        let chunk = [0; 16 * 1024];
+        frame(&mut socket, 0, 0, 1, &chunk).await;
+        let held = reports.recv().await.unwrap();
+        assert!(
+            held >= GROWTH - chunk.len(),
+            "lowering must not refund unused peer credit"
+        );
+        let mut sent = chunk.len();
+        while sent + chunk.len() <= 65_535 + GROWTH {
+            frame(&mut socket, 0, 0, 1, &chunk).await;
+            sent += chunk.len();
+        }
+        frame(&mut socket, 0, 1, 1, &chunk[..65_535 + GROWTH - sent]).await;
+        assert_eq!(reports.recv().await.unwrap(), 0);
+        drop(socket);
+        task.await.unwrap();
+        assert_eq!(meter.used(), 0);
+    })
+    .await
+    .unwrap();
+}

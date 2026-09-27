@@ -105,6 +105,10 @@ impl<T, B> Codec<T, B> {
         self.inner.set_max_header_list_size(val);
     }
 
+    pub(crate) fn set_recv_header_budget(&mut self, budget: crate::budget::Budget) {
+        self.inner.set_header_budget(budget);
+    }
+
     /// Get a reference to the inner stream.
     #[cfg(feature = "unstable")]
     pub fn get_ref(&self) -> &T {

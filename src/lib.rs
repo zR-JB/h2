@@ -107,6 +107,7 @@ macro_rules! ready {
     };
 }
 
+mod budget;
 #[cfg_attr(feature = "unstable", allow(missing_docs))]
 mod codec;
 mod error;
@@ -135,6 +136,7 @@ mod share;
 #[cfg_attr(feature = "unstable", allow(missing_docs))]
 pub mod fuzz_bridge;
 
+pub use crate::budget::SharedBudget;
 pub use crate::error::{Error, Reason};
 pub use crate::share::{FlowControl, Ping, PingPong, Pong, RecvStream, SendStream, StreamId};
 

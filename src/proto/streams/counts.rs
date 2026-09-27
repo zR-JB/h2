@@ -1,4 +1,5 @@
 use super::*;
+use crate::budget::Charge;
 
 #[derive(Debug)]
 struct Budget {
@@ -73,11 +74,17 @@ pub(super) struct Counts {
     /// Number of empty, non-final DATA frames received over the lifetime of
     /// the connection.
     num_recv_empty_data_frames: usize,
+
+    state_budget: crate::budget::Budget,
+
+    data_frames: Charge,
+
+    send_frame_bytes: usize,
 }
 
 impl Counts {
     /// Create a new `Counts` using the provided configuration values.
-    pub fn new(peer: peer::Dyn, config: &Config) -> Self {
+    pub fn new(peer: peer::Dyn, config: &Config, send_frame_bytes: usize) -> Self {
         Counts {
             peer,
             max_send_streams: config.initial_max_send_streams,
@@ -92,6 +99,9 @@ impl Counts {
             num_local_error_reset_streams: 0,
             data_frame_budget: Budget::new(config.data_frame_budget),
             num_recv_empty_data_frames: 0,
+            state_budget: config.state_budget.clone(),
+            data_frames: Charge::default(),
+            send_frame_bytes,
         }
     }
 
@@ -106,14 +116,29 @@ impl Counts {
         Ok(())
     }
 
-    pub fn record_data_frame(&mut self) -> Result<(), BudgetExhausted> {
+    pub fn send_frame_bytes(&self) -> usize {
+        self.send_frame_bytes
+    }
+
+    pub fn record_data_frame(&mut self) -> Result<bool, BudgetExhausted> {
         self.data_frame_budget
-            .consume(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD)
+            .consume(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD)?;
+        let charged = self
+            .data_frames
+            .try_add(&self.state_budget, DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD);
+        if !charged {
+            self.data_frame_budget
+                .replenish(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD);
+        }
+        Ok(charged)
     }
 
     pub fn release_data_frame(&mut self) {
         self.data_frame_budget
             .replenish(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD);
+        let charged = self.data_frames.bytes();
+        self.data_frames
+            .shrink_to(charged.saturating_sub(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD));
     }
 
     /// Returns true when the next opened stream will reach capacity of outbound streams
@@ -296,6 +321,8 @@ impl Counts {
             }
         }
 
+        stream.settle_charges(self.send_frame_bytes);
+
         // Release the stream if it requires releasing
         if stream.is_released() {
             stream.remove();
@@ -365,7 +392,10 @@ mod tests {
                 remote_max_initiated: None,
                 local_max_error_reset_streams: None,
                 data_frame_budget: DEFAULT_DATA_FRAME_BUDGET,
+                shared_budget: None,
+                state_budget: None,
             },
+            0,
         )
     }
 

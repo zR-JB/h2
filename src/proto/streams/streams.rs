@@ -118,7 +118,7 @@ where
         }
     }
 
-    pub fn set_target_connection_window_size(&mut self, size: WindowSize) -> Result<(), Reason> {
+    pub fn set_target_connection_window_size(&mut self, size: WindowSize) -> Result<bool, Reason> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
@@ -450,7 +450,7 @@ impl<B> DynStreams<'_, B> {
 impl Inner {
     fn new(peer: peer::Dyn, config: Config, send_frame_size: usize) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Inner {
-            counts: Counts::new(peer, &config),
+            counts: Counts::new(peer, &config, send_frame_size),
             actions: Actions {
                 recv: Recv::new(peer, &config),
                 send: Send::new(&config, send_frame_size),
@@ -1211,7 +1211,10 @@ impl<B> StreamRef<B> {
 
         me.counts.transition(stream, |counts, stream| {
             // Create the trailers frame
-            let frame = frame::Headers::trailers(stream.id, trailers);
+            let mut frame = frame::Headers::trailers(stream.id, trailers);
+            if !frame.try_charge(actions.send.state_budget()) {
+                return Err(UserError::SendBufferFull);
+            }
 
             // Send the trailers frame
             actions
@@ -1244,7 +1247,10 @@ impl<B> StreamRef<B> {
         }
     }
 
-    pub fn send_informational_headers(&mut self, frame: frame::Headers) -> Result<(), UserError> {
+    pub fn send_informational_headers(
+        &mut self,
+        mut frame: frame::Headers,
+    ) -> Result<(), UserError> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
@@ -1267,6 +1273,9 @@ impl<B> StreamRef<B> {
             // Ensure the frame is not marked as end_stream for informational responses
             if frame.is_end_stream() {
                 return Err(UserError::UnexpectedFrameType);
+            }
+            if !frame.try_charge(actions.send.state_budget()) {
+                return Err(UserError::SendBufferFull);
             }
 
             // Send the interim informational headers directly to the buffer without state changes
@@ -1297,7 +1306,10 @@ impl<B> StreamRef<B> {
         let send_buffer = &mut *send_buffer;
 
         me.counts.transition(stream, |counts, stream| {
-            let frame = server::Peer::convert_send_message(stream.id, response, end_of_stream);
+            let mut frame = server::Peer::convert_send_message(stream.id, response, end_of_stream);
+            if !frame.try_charge(actions.send.state_budget()) {
+                return Err(UserError::SendBufferFull);
+            }
 
             actions
                 .send
@@ -1566,6 +1578,15 @@ impl OpaqueStreamRef {
         me.actions
             .recv
             .release_capacity(capacity, &mut stream, &mut me.actions.task)
+    }
+
+    pub fn set_target_connection_window_size(&mut self, size: WindowSize) -> bool {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions
+            .recv
+            .set_target_connection_window(size, &mut me.actions.task)
+            .unwrap_or(false)
     }
 
     /// Clear the receive queue and set the status to no longer receive data frames.

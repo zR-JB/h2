@@ -1,3 +1,4 @@
+use crate::budget::{Allowance, Budget, SharedBudget};
 use crate::codec::UserError;
 use crate::frame::{Reason, StreamId};
 use crate::{client, server};
@@ -10,6 +11,7 @@ use futures_core::Stream;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncRead;
@@ -84,6 +86,8 @@ pub(crate) struct Config {
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
     pub data_frame_budget: usize,
+    pub shared_budget: Budget,
+    pub max_state: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -124,8 +128,13 @@ where
     P: Peer,
     B: Buf,
 {
-    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
-        fn streams_config(config: &Config) -> streams::Config {
+    pub fn new(mut codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+        let state_budget = config
+            .shared_budget
+            .as_ref()
+            .map(|_| Arc::new(Allowance::new(config.max_state)) as Arc<dyn SharedBudget>);
+        codec.set_recv_header_budget(state_budget.clone());
+        fn streams_config(config: &Config, state_budget: Budget) -> streams::Config {
             streams::Config {
                 initial_max_send_streams: config.initial_max_send_streams,
                 local_max_buffer_size: config.max_send_buffer_size,
@@ -145,9 +154,11 @@ where
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 data_frame_budget: config.data_frame_budget,
+                shared_budget: config.shared_budget.clone(),
+                state_budget,
             }
         }
-        let streams = Streams::new(streams_config(&config));
+        let streams = Streams::new(streams_config(&config, state_budget));
         let span = tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         span.follows_from(tracing::Span::current());
         Connection {

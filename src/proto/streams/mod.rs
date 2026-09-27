@@ -83,6 +83,10 @@ pub struct Config {
     ///
     /// Default 25600 bytes
     pub data_frame_budget: usize,
+
+    pub shared_budget: crate::budget::Budget,
+
+    pub state_budget: crate::budget::Budget,
 }
 
 trait DebugStructExt<'a, 'b> {

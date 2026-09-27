@@ -1,5 +1,6 @@
 use super::store::Resolve;
 use super::*;
+use crate::budget::Budget;
 
 use crate::frame::Reason;
 
@@ -57,6 +58,8 @@ pub(super) struct Prioritize {
     /// The maximum amount of bytes a stream should buffer.
     max_buffer_size: usize,
     max_buffered_data_frames: usize,
+
+    state_budget: Budget,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -103,7 +106,12 @@ impl Prioritize {
             in_flight_data_frame: InFlightData::Nothing,
             max_buffer_size: config.local_max_buffer_size,
             max_buffered_data_frames: (config.local_max_buffer_size / send_frame_size).max(1),
+            state_budget: config.state_budget.clone(),
         }
+    }
+
+    pub(crate) fn state_budget(&self) -> &Budget {
+        &self.state_budget
     }
 
     pub(crate) fn max_buffered_data_frames(&self) -> usize {
@@ -177,6 +185,12 @@ impl Prioritize {
 
         if stream.buffered_send_frames >= self.max_buffered_data_frames
             && !(sz == 0 && frame.is_end_stream())
+        {
+            return Err(UserError::SendBufferFull);
+        }
+        if !stream
+            .send_charge
+            .try_add(&self.state_budget, counts.send_frame_bytes())
         {
             return Err(UserError::SendBufferFull);
         }

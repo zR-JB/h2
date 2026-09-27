@@ -1,4 +1,5 @@
 use super::*;
+use crate::budget::{Budget, Charge};
 use crate::codec::UserError;
 use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
 use crate::proto;
@@ -59,6 +60,10 @@ pub(super) struct Recv {
 
     /// If extended connect protocol is enabled.
     is_extended_connect_protocol_enabled: bool,
+
+    shared_budget: Budget,
+
+    credit: Charge,
 }
 
 #[derive(Debug)]
@@ -113,6 +118,8 @@ impl Recv {
             refused: None,
             is_push_enabled: config.local_push_enabled,
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
+            shared_budget: config.shared_budget.clone(),
+            credit: Charge::default(),
         }
     }
 
@@ -160,7 +167,7 @@ impl Recv {
     /// The caller ensures that the frame represents headers and not trailers.
     pub fn recv_headers(
         &mut self,
-        frame: frame::Headers,
+        mut frame: frame::Headers,
         stream: &mut store::Ptr,
         counts: &mut Counts,
     ) -> Result<(), RecvHeaderBlockError<Option<Box<frame::Headers>>>> {
@@ -239,6 +246,7 @@ impl Recv {
             };
         }
 
+        stream.recv_headers_charge.absorb(frame.take_charge());
         let stream_id = frame.stream_id();
         let (pseudo, fields) = frame.into_parts();
 
@@ -417,7 +425,7 @@ impl Recv {
     /// Transition the stream based on receiving trailers
     pub fn recv_trailers(
         &mut self,
-        frame: frame::Headers,
+        mut frame: frame::Headers,
         stream: &mut store::Ptr,
     ) -> Result<(), Error> {
         if frame.is_over_size() {
@@ -432,6 +440,7 @@ impl Recv {
             return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
+        stream.recv_headers_charge.absorb(frame.take_charge());
         let trailers = frame.into_fields();
 
         // Push the frame onto the stream's recv buffer
@@ -458,12 +467,32 @@ impl Recv {
         // TODO: proper error handling
         let _res = self.flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
+        let target = self
+            .flow
+            .available()
+            .as_size()
+            .saturating_add(self.in_flight_data);
+        self.settle_credit(target);
 
         if self.flow.unclaimed_capacity().is_some() {
             if let Some(task) = task.take() {
                 task.wake();
             }
         }
+    }
+
+    /// Keeps charged whatever window the peer may still fill beyond the default.
+    fn settle_credit(&mut self, target: WindowSize) -> bool {
+        let peer = self.flow.window_size() as usize + self.in_flight_data as usize;
+        let needed = peer
+            .max(target as usize)
+            .saturating_sub(DEFAULT_INITIAL_WINDOW_SIZE as usize);
+        let charged = self.credit.bytes();
+        if needed > charged {
+            return self.credit.try_add(&self.shared_budget, needed - charged);
+        }
+        self.credit.shrink_to(needed);
+        true
     }
 
     /// Releases capacity back to the connection & stream
@@ -540,7 +569,7 @@ impl Recv {
         &mut self,
         target: WindowSize,
         task: &mut Option<Waker>,
-    ) -> Result<(), Reason> {
+    ) -> Result<bool, Reason> {
         tracing::trace!(
             "set_target_connection_window; target={}; available={}, reserved={}",
             target,
@@ -558,6 +587,9 @@ impl Recv {
             .available()
             .add(self.in_flight_data)?
             .checked_size();
+        if !self.settle_credit(target) {
+            return Ok(false);
+        }
         if target > current {
             self.flow.assign_capacity(target - current)?;
         } else {
@@ -572,7 +604,7 @@ impl Recv {
                 task.wake();
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn apply_local_settings(
@@ -747,6 +779,15 @@ impl Recv {
             return Ok(());
         }
 
+        let is_event = !frame.payload().is_empty() || frame.is_end_stream();
+        if is_event
+            && !counts.record_data_frame().map_err(|_| {
+                Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
+            })?
+        {
+            return Err(Error::library_reset(stream.id, Reason::ENHANCE_YOUR_CALM));
+        }
+
         // Update stream level flow control
         stream
             .recv_flow
@@ -773,15 +814,12 @@ impl Recv {
         // An empty DATA frame without END_STREAM has no effect on the HTTP
         // message. Padding has already been accounted for and released above,
         // so there is no event to pass to the user.
-        if frame.payload().is_empty() && !frame.is_end_stream() {
+        if !is_event {
             return counts.record_empty_data_frame().map_err(|_| {
                 Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
             });
         }
 
-        counts.record_data_frame().map_err(|_| {
-            Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
-        })?;
         let payload = frame.into_payload();
         let event = Event::Data(DataEvent {
             payload: Bytes::copy_from_slice(&payload),
@@ -1345,6 +1383,8 @@ mod tests {
             remote_max_initiated: None,
             local_max_error_reset_streams: None,
             data_frame_budget: DEFAULT_DATA_FRAME_BUDGET,
+            shared_budget: None,
+            state_budget: None,
         };
         let mut recv = Recv::new(peer::Dyn::Server, &config);
         let mut store = Store::new();
@@ -1365,7 +1405,7 @@ mod tests {
         stream.in_flight_recv_data = DEFAULT_INITIAL_WINDOW_SIZE;
         recv.in_flight_data = DEFAULT_INITIAL_WINDOW_SIZE;
 
-        let mut counts = Counts::new(peer::Dyn::Server, &config);
+        let mut counts = Counts::new(peer::Dyn::Server, &config, 0);
         recv.clear_recv_buffer(&mut stream, &mut None, &mut counts);
 
         assert!(stream.pending_recv.is_empty());

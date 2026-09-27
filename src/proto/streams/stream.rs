@@ -1,6 +1,7 @@
 use crate::Reason;
 
 use super::*;
+use crate::budget::Charge;
 
 use std::fmt;
 use std::task::{Context, Waker};
@@ -48,6 +49,10 @@ pub(super) struct Stream {
     /// TODO: Technically this could be greater than the window size...
     pub buffered_send_data: usize,
     pub buffered_send_frames: usize,
+
+    pub send_charge: Charge,
+
+    pub recv_headers_charge: Charge,
 
     /// Task tracking additional send capacity (i.e. window updates).
     send_task: Option<Waker>,
@@ -172,6 +177,8 @@ impl Stream {
             requested_send_capacity: 0,
             buffered_send_data: 0,
             buffered_send_frames: 0,
+            send_charge: Charge::default(),
+            recv_headers_charge: Charge::default(),
             send_task: None,
             pending_send: buffer::Deque::new(),
             is_pending_send_capacity: false,
@@ -253,6 +260,14 @@ impl Stream {
     }
 
     /// Returns true if the stream is no longer in use
+    pub fn settle_charges(&mut self, send_frame_bytes: usize) {
+        if self.ref_count == 0 && self.pending_recv.is_empty() {
+            self.recv_headers_charge.shrink_to(0);
+        }
+        self.send_charge
+            .shrink_to(self.buffered_send_frames * send_frame_bytes);
+    }
+
     pub fn is_released(&self) -> bool {
         // The stream is closed and fully flushed
         self.is_closed() &&

@@ -1368,6 +1368,8 @@ where
                 data_frame_budget: builder
                     .data_frame_budget
                     .resolve(builder.initial_target_connection_window_size),
+                shared_budget: None,
+                max_state: 0,
             },
         );
         let send_request = SendRequest {

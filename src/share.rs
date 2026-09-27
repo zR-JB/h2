@@ -537,6 +537,15 @@ impl FlowControl {
             .release_capacity(sz as proto::WindowSize)
             .map_err(Into::into)
     }
+
+    /// Sets the connection's target receive window from a stream handle,
+    /// returning `false` when its [shared budget] cannot fund it.
+    ///
+    /// [shared budget]: crate::server::Builder::shared_budget
+    pub fn set_target_connection_window_size(&mut self, size: u32) -> bool {
+        assert!(size <= proto::MAX_WINDOW_SIZE);
+        self.inner.set_target_connection_window_size(size)
+    }
 }
 
 // ===== impl PingPong =====

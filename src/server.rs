@@ -263,6 +263,10 @@ pub struct Builder {
     ///
     /// When this gets exhausted, we issue a GOAWAY with `ENHANCE_YOUR_CALM`.
     data_frame_budget: proto::DataFrameBudget,
+
+    shared_budget: crate::budget::Budget,
+
+    max_state: usize,
 }
 
 /// Send a response back to the client
@@ -662,6 +666,8 @@ impl Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
+            shared_budget: None,
+            max_state: 0,
         }
     }
 
@@ -1066,6 +1072,24 @@ impl Builder {
     /// also increases the permitted framing overhead.
     pub fn data_frame_budget(&mut self, budget: usize) -> &mut Self {
         self.data_frame_budget = proto::DataFrameBudget::Configured(budget);
+        self
+    }
+
+    /// Charges receive window beyond the default 65,535 bytes to `budget` while
+    /// the peer may still fill it, refusing targets it cannot fund.
+    ///
+    /// Headers, buffered DATA frames and queued response metadata are charged
+    /// to a per-connection `max_state` allowance the caller reserves; request
+    /// headers stay charged until their stream's handles and queued trailers
+    /// are gone. Past it, requests are refused, received DATA resets its
+    /// stream and sends fail.
+    pub fn shared_budget(
+        &mut self,
+        budget: std::sync::Arc<dyn crate::SharedBudget>,
+        max_state: usize,
+    ) -> &mut Self {
+        self.shared_budget = Some(budget);
+        self.max_state = max_state;
         self
     }
 
@@ -1538,6 +1562,8 @@ where
                                 .builder
                                 .data_frame_budget
                                 .resolve(self.builder.initial_target_connection_window_size),
+                            shared_budget: self.builder.shared_budget.clone(),
+                            max_state: self.builder.max_state,
                         },
                     );
 

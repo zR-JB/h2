@@ -100,6 +100,10 @@ impl<T> FramedRead<T> {
         self.max_continuation_frames = calc_max_continuation_frames(val, self.max_frame_size());
     }
 
+    pub(crate) fn set_header_budget(&mut self, budget: crate::budget::Budget) {
+        self.hpack.set_budget(budget);
+    }
+
     /// Update the header table size setting.
     #[inline]
     pub fn set_header_table_size(&mut self, val: usize) {
