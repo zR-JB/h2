@@ -95,34 +95,25 @@ impl Counts {
         }
     }
 
-    /// Records the framing overhead of a DATA frame.
-    pub fn record_data_frame(&mut self, payload_len: usize) -> Result<(), BudgetExhausted> {
-        if payload_len == 0 {
-            self.num_recv_empty_data_frames = self
-                .num_recv_empty_data_frames
-                .checked_add(1)
-                .ok_or(BudgetExhausted)?;
-            if self.num_recv_empty_data_frames > MAX_RECV_EMPTY_DATA_FRAMES {
-                return Err(BudgetExhausted);
-            }
-            Ok(())
-        } else if payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
-            self.data_frame_budget
-                .consume(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len)
-        } else {
-            self.data_frame_budget
-                .replenish(payload_len - DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD);
-            Ok(())
+    pub fn record_empty_data_frame(&mut self) -> Result<(), BudgetExhausted> {
+        self.num_recv_empty_data_frames = self
+            .num_recv_empty_data_frames
+            .checked_add(1)
+            .ok_or(BudgetExhausted)?;
+        if self.num_recv_empty_data_frames > MAX_RECV_EMPTY_DATA_FRAMES {
+            return Err(BudgetExhausted);
         }
+        Ok(())
     }
 
-    /// Releases the framing overhead of a DATA frame that is no longer
-    /// buffered internally.
-    pub fn release_data_frame(&mut self, payload_len: usize) {
-        if payload_len != 0 && payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
-            self.data_frame_budget
-                .replenish(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len);
-        }
+    pub fn record_data_frame(&mut self) -> Result<(), BudgetExhausted> {
+        self.data_frame_budget
+            .consume(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD)
+    }
+
+    pub fn release_data_frame(&mut self) {
+        self.data_frame_budget
+            .replenish(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD);
     }
 
     /// Returns true when the next opened stream will reach capacity of outbound streams
@@ -295,7 +286,10 @@ impl Counts {
                 }
             }
 
-            if !stream.state.is_scheduled_reset() && stream.is_counted {
+            if !stream.state.is_scheduled_reset()
+                && stream.is_counted
+                && stream.pending_recv.is_empty()
+            {
                 tracing::trace!("dec_num_streams; stream={:?}", stream.id);
                 // Decrement the number of active streams.
                 self.dec_num_streams(&mut stream);
@@ -394,51 +388,25 @@ mod tests {
     }
 
     #[test]
-    fn good_sized_data_frames_do_not_exhaust_budget() {
+    fn buffered_events_hold_budget_until_removal() {
         let mut counts = counts();
-
-        for _ in 0..1_000_000 {
-            counts
-                .record_data_frame(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD)
-                .unwrap();
-        }
+        counts.data_frame_budget = Budget::new(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 2);
+        counts.record_data_frame().unwrap();
+        counts.record_data_frame().unwrap();
+        assert!(counts.record_data_frame().is_err());
+        counts.release_data_frame();
+        counts.record_data_frame().unwrap();
+        assert!(counts.record_data_frame().is_err());
     }
 
     #[test]
-    fn consumed_small_data_frames_do_not_exhaust_budget() {
+    fn empty_frames_have_a_separate_lifetime_limit() {
         let mut counts = counts();
-
-        for _ in 0..1_000_000 {
-            counts.record_data_frame(1).unwrap();
-            counts.release_data_frame(1);
-        }
-    }
-
-    #[test]
-    fn empty_data_frames_do_not_consume_data_frame_budget() {
-        let mut counts = counts();
-        counts.data_frame_budget = Budget::new(0);
-
         for _ in 0..MAX_RECV_EMPTY_DATA_FRAMES {
-            counts.record_data_frame(0).unwrap();
+            counts.record_empty_data_frame().unwrap();
+            counts.record_data_frame().unwrap();
+            counts.release_data_frame();
         }
-
-        // Empty frames have their own limit, while a non-empty small frame
-        // still consumes the independently configured DATA frame budget.
-        assert!(counts.record_data_frame(0).is_err());
-        assert!(counts.record_data_frame(1).is_err());
-    }
-
-    #[test]
-    fn large_data_frames_do_not_replenish_empty_data_frame_limit() {
-        let mut counts = counts();
-
-        for _ in 0..MAX_RECV_EMPTY_DATA_FRAMES {
-            counts.record_data_frame(0).unwrap();
-            counts
-                .record_data_frame(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 2)
-                .unwrap();
-        }
-        assert!(counts.record_data_frame(0).is_err());
+        assert!(counts.record_empty_data_frame().is_err());
     }
 }

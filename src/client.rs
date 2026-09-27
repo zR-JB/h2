@@ -1152,16 +1152,14 @@ impl Builder {
     }
 
     /// Sets a connection-level budget for limiting memory overhead from
-    /// received small DATA frames.
+    /// received DATA frames.
     ///
     /// HTTP/2 flow control accounts for DATA payload bytes, but not the
     /// additional memory required to buffer each DATA frame. An excessive
     /// number of small frames may therefore consume disproportionate memory.
     ///
-    /// Small DATA frames consume this budget. The budget is restored when
-    /// buffered frames are consumed by the application, while sufficiently
-    /// large frames may also restore budget. Empty DATA frames are limited
-    /// separately and do not consume this budget.
+    /// Each buffered DATA frame consumes 256 bytes until it is removed.
+    /// Empty non-final DATA frames are ignored and limited separately.
     ///
     /// When this budget is exhausted, the connection is closed with
     /// `ENHANCE_YOUR_CALM`.
