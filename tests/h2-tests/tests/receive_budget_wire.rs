@@ -632,6 +632,50 @@ async fn header_and_data_floods_stay_within_the_connection_allowance() {
 }
 
 #[tokio::test]
+async fn ended_connections_refund_window_credit_that_live_streams_hold() {
+    const GROWTH: usize = 128 * 1024;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for fault in [false, true] {
+            let meter = Meter::new(1 << 20);
+            let budget = meter.clone();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut builder = h2::server::Builder::new();
+                builder.shared_budget(budget.clone(), 64 * 1024);
+                let mut connection = builder.handshake::<_, Bytes>(socket).await.unwrap();
+                let (request, _reply) = connection.accept().await.unwrap().unwrap();
+                let mut body = request.into_body();
+                let flow = body.flow_control();
+                let target = (65_535 + GROWTH) as u32;
+                assert!(flow.set_target_connection_window_size(target));
+                assert_eq!(budget.used(), GROWTH);
+                while let Some(Ok(_)) = connection.accept().await {}
+                flow.set_target_connection_window_size(target);
+                assert_eq!(budget.used(), 0, "held streams kept ended credit");
+            });
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            socket
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            frame(&mut socket, 4, 0, 0, &[]).await;
+            frame(&mut socket, 1, 4, 1, b"\x83\x86\x84\x01\x09localhost").await;
+            while next(&mut socket).await.0 != 8 {}
+            if fault {
+                frame(&mut socket, 0, 0, 0, b"x").await;
+            } else {
+                socket.shutdown().await.unwrap();
+            }
+            task.await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn receive_window_growth_is_funded_and_refunded_as_peer_credit_drains() {
     const GROWTH: usize = 128 * 1024;
     tokio::time::timeout(std::time::Duration::from_secs(10), async {

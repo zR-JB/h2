@@ -485,6 +485,11 @@ impl Recv {
         }
     }
 
+    pub fn refund_credit(&mut self) {
+        self.shared_budget = None;
+        self.credit.shrink_to(0);
+    }
+
     /// Keeps charged whatever window the peer may still fill beyond the default.
     fn settle_credit(&mut self, target: WindowSize) -> bool {
         let peer = self.flow.window_size() as usize + self.in_flight_data as usize;
