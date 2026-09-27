@@ -163,7 +163,7 @@ impl Recv {
         frame: frame::Headers,
         stream: &mut store::Ptr,
         counts: &mut Counts,
-    ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
+    ) -> Result<(), RecvHeaderBlockError<Option<Box<frame::Headers>>>> {
         tracing::trace!("opening stream; init_window={}", self.init_window_sz);
         let is_initial = stream.state.recv_open(&frame)?;
 
@@ -233,7 +233,7 @@ impl Recv {
                     HeaderMap::new(),
                 );
                 res.set_end_stream();
-                Err(RecvHeaderBlockError::Oversize(Some(res)))
+                Err(RecvHeaderBlockError::Oversize(Some(Box::new(res))))
             } else {
                 Err(RecvHeaderBlockError::Oversize(None))
             };
@@ -1303,6 +1303,20 @@ impl Recv {
     }
 }
 
+impl Open {
+    pub fn is_push_promise(&self) -> bool {
+        matches!(*self, Self::PushPromise)
+    }
+}
+
+// ===== impl RecvHeaderBlockError =====
+
+impl<T> From<Error> for RecvHeaderBlockError<T> {
+    fn from(err: Error) -> Self {
+        RecvHeaderBlockError::State(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,21 +1365,7 @@ mod tests {
         assert!(stream.pending_recv.is_empty());
         assert_eq!(stream.in_flight_recv_data, 0);
         assert_eq!(recv.in_flight_data, 0);
-    }
-}
-
-// ===== impl Open =====
-
-impl Open {
-    pub fn is_push_promise(&self) -> bool {
-        matches!(*self, Self::PushPromise)
-    }
-}
-
-// ===== impl RecvHeaderBlockError =====
-
-impl<T> From<Error> for RecvHeaderBlockError<T> {
-    fn from(err: Error) -> Self {
-        RecvHeaderBlockError::State(err)
+        stream.unlink();
+        stream.remove();
     }
 }

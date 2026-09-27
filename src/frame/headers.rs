@@ -948,7 +948,7 @@ impl HeaderBlock {
                         }
                         if !self.is_over_size {
                             self.field_size += header_size;
-                            if let Err(_) = self.fields.try_append(name, value) {
+                            if self.fields.try_append(name, value).is_err() {
                                 // HeaderMap capacity exceeded — treat as over-size
                                 // so the stream is rejected downstream (RST_STREAM / 431)
                                 // instead of panicking on the 24,577th unique header.
@@ -1245,16 +1245,7 @@ mod test {
         let num_headers = 25_000;
 
         // Build the HPACK block
-        let mut hpack = Vec::new();
-
-        // Pseudo-headers
-        hpack.push(0x82u8); // :method GET (static index 2)
-        hpack.push(0x86); // :scheme http (static index 6)
-        hpack.push(0x84); // :path / (static index 4)
-
-        // :authority "localhost" — literal with incremental indexing
-        hpack.push(0x41); // literal with indexing, name index 1 (= ":authority")
-        hpack.push(0x09); // value length 9
+        let mut hpack = vec![0x82, 0x86, 0x84, 0x41, 0x09];
         hpack.extend_from_slice(b"localhost");
 
         // 25,000 unique headers: "literal without indexing, new name"
