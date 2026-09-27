@@ -1069,6 +1069,9 @@ impl Builder {
     /// stream have been written to the connection, the send buffer capacity
     /// will be freed up again.
     ///
+    /// DATA event metadata has the same per-stream allowance. Capacity remains
+    /// unavailable until enough buffered events are removed.
+    ///
     /// The default is currently ~400KB, but may change.
     ///
     /// # Panics

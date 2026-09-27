@@ -56,6 +56,7 @@ pub(super) struct Prioritize {
 
     /// The maximum amount of bytes a stream should buffer.
     max_buffer_size: usize,
+    max_buffered_data_frames: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -81,7 +82,7 @@ pub(crate) struct Prioritized<B> {
 // ===== impl Prioritize =====
 
 impl Prioritize {
-    pub fn new(config: &Config) -> Prioritize {
+    pub fn new(config: &Config, send_frame_size: usize) -> Prioritize {
         let mut flow = FlowControl::new();
 
         flow.inc_window(config.remote_init_window_sz)
@@ -101,7 +102,12 @@ impl Prioritize {
             last_opened_id: StreamId::ZERO,
             in_flight_data_frame: InFlightData::Nothing,
             max_buffer_size: config.local_max_buffer_size,
+            max_buffered_data_frames: (config.local_max_buffer_size / send_frame_size).max(1),
         }
+    }
+
+    pub(crate) fn max_buffered_data_frames(&self) -> usize {
+        self.max_buffered_data_frames
     }
 
     pub(crate) fn max_buffer_size(&self) -> usize {
@@ -168,6 +174,13 @@ impl Prioritize {
                 return Err(UnexpectedFrameType);
             }
         }
+
+        if stream.buffered_send_frames >= self.max_buffered_data_frames
+            && !(sz == 0 && frame.is_end_stream())
+        {
+            return Err(UserError::SendBufferFull);
+        }
+        stream.buffered_send_frames += 1;
 
         // Update the buffered data counter
         stream.buffered_send_data += sz as usize;
@@ -459,7 +472,7 @@ impl Prioritize {
             tracing::trace!(capacity = assign, "assigning");
 
             // Assign the capacity to the stream
-            stream.assign_capacity(assign, self.max_buffer_size);
+            stream.assign_capacity(assign, self.max_buffer_size, self.max_buffered_data_frames);
 
             // Claim the capacity from the connection
             // TODO: proper error handling
@@ -517,7 +530,7 @@ impl Prioritize {
         B: Buf,
     {
         // Reclaim any frame that has previously been written
-        self.reclaim_frame(buffer, store, dst);
+        self.reclaim_frame(buffer, store, counts, dst);
 
         // The max frame length
         let max_frame_len = dst.max_send_frame_size();
@@ -548,7 +561,7 @@ impl Prioritize {
                     // which records completion in a single codec slot. Reclaim
                     // before accepting another frame so that slot is not
                     // overwritten.
-                    self.reclaim_frame(buffer, store, dst);
+                    self.reclaim_frame(buffer, store, counts, dst);
                 }
                 None => {
                     return Ok(BufferStatus::Complete);
@@ -561,12 +574,13 @@ impl Prioritize {
         &mut self,
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
+        counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> bool
     where
         B: Buf,
     {
-        self.reclaim_frame(buffer, store, dst)
+        self.reclaim_frame(buffer, store, counts, dst)
     }
 
     /// Tries to reclaim a pending data frame from the codec.
@@ -580,6 +594,7 @@ impl Prioritize {
         &mut self,
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
+        counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> bool
     where
@@ -590,7 +605,7 @@ impl Prioritize {
 
         // First check if there are any data chunks to take back
         if let Some(frame) = dst.take_last_data_frame() {
-            self.reclaim_frame_inner(buffer, store, frame)
+            self.reclaim_frame_inner(buffer, store, counts, frame)
         } else {
             false
         }
@@ -600,6 +615,7 @@ impl Prioritize {
         &mut self,
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
+        counts: &mut Counts,
         frame: frame::Data<Prioritized<B>>,
     ) -> bool
     where
@@ -617,7 +633,10 @@ impl Prioritize {
         match mem::replace(&mut self.in_flight_data_frame, InFlightData::Nothing) {
             InFlightData::Nothing => panic!("wasn't expecting a frame to reclaim"),
             InFlightData::Drop => {
-                tracing::trace!("not reclaiming frame for cancelled stream");
+                let mut stream = store.resolve(key);
+                stream.buffered_send_frames -= 1;
+                let is_reset = stream.is_pending_reset_expiration();
+                counts.transition_after(stream, is_reset);
                 return false;
             }
             InFlightData::DataFrame(k) => {
@@ -643,6 +662,11 @@ impl Prioritize {
             return true;
         }
 
+        let mut stream = store.resolve(key);
+        stream.buffered_send_frames -= 1;
+        stream.notify_capacity();
+        let is_reset = stream.is_pending_reset_expiration();
+        counts.transition_after(stream, is_reset);
         false
     }
 
@@ -670,6 +694,9 @@ impl Prioritize {
 
         // TODO: make this more efficient?
         while let Some(frame) = stream.pending_send.pop_front(buffer) {
+            if matches!(frame, Frame::Data(_)) {
+                stream.buffered_send_frames -= 1;
+            }
             tracing::trace!(?frame, "dropping");
         }
 
@@ -805,7 +832,11 @@ impl Prioritize {
 
                             // Update the flow control
                             tracing::trace_span!("updating stream flow").in_scope(|| {
-                                stream.send_data(len, self.max_buffer_size);
+                                stream.send_data(
+                                    len,
+                                    self.max_buffer_size,
+                                    self.max_buffered_data_frames,
+                                );
 
                                 // Assign the capacity back to the connection that
                                 // was just consumed from the stream in the previous

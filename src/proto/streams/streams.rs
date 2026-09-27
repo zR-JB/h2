@@ -112,7 +112,7 @@ where
         let peer = P::r#dyn();
 
         Streams {
-            inner: Inner::new(peer, config),
+            inner: Inner::new(peer, config, Buffer::<Frame<B>>::slot_size()),
             send_buffer: Arc::new(SendBuffer::new()),
             _p: ::std::marker::PhantomData,
         }
@@ -448,12 +448,12 @@ impl<B> DynStreams<'_, B> {
 }
 
 impl Inner {
-    fn new(peer: peer::Dyn, config: Config) -> Arc<Mutex<Self>> {
+    fn new(peer: peer::Dyn, config: Config, send_frame_size: usize) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Inner {
             counts: Counts::new(peer, &config),
             actions: Actions {
                 recv: Recv::new(peer, &config),
-                send: Send::new(&config),
+                send: Send::new(&config, send_frame_size),
                 task: None,
                 conn_error: None,
             },
@@ -997,7 +997,7 @@ impl Inner {
 
         self.actions
             .send
-            .reclaim_written_frame(send_buffer, &mut self.store, dst)
+            .reclaim_written_frame(send_buffer, &mut self.store, &mut self.counts, dst)
     }
 
     fn send_reset<B>(
