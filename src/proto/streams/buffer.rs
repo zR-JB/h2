@@ -1,5 +1,7 @@
 use slab::Slab;
 
+const IDLE_SLOTS: usize = 64;
+
 /// Buffers frames for multiple streams.
 #[derive(Debug)]
 pub struct Buffer<T> {
@@ -87,6 +89,10 @@ impl Deque {
         match self.indices {
             Some(mut idxs) => {
                 let mut slot = buf.slab.remove(idxs.head);
+                // Charges end with each slot; do not retain a burst's capacity.
+                if buf.slab.is_empty() && buf.slab.capacity() > IDLE_SLOTS {
+                    buf.slab = Slab::new();
+                }
 
                 if idxs.head == idxs.tail {
                     assert!(slot.next.is_none());
