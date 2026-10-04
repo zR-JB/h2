@@ -32,6 +32,7 @@ impl Allowance {
 }
 
 impl SharedBudget for Allowance {
+    #[allow(deprecated)] // try_update needs Rust 1.99; the crate supports 1.63
     fn try_charge(&self, bytes: usize) -> bool {
         let max = self.max;
         self.used
