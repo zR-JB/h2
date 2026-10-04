@@ -17,6 +17,9 @@ use std::fmt;
 // becomes greater than 1/2, or 50 bytes.
 const UNCLAIMED_NUMERATOR: i32 = 1;
 const UNCLAIMED_DENOMINATOR: i32 = 2;
+// A large window is refreshed once this much of it is unclaimed, so a peer on a long path keeps
+// nearly all of it in flight.
+const MAX_UNCLAIMED: i32 = 1 << 20;
 
 #[test]
 #[allow(clippy::assertions_on_constants)]
@@ -24,6 +27,31 @@ fn sanity_unclaimed_ratio() {
     assert!(UNCLAIMED_NUMERATOR < UNCLAIMED_DENOMINATOR);
     assert!(UNCLAIMED_NUMERATOR >= 0);
     assert!(UNCLAIMED_DENOMINATOR > 0);
+}
+
+#[test]
+fn large_windows_refresh_once_a_mebibyte_is_unclaimed() {
+    // The peer sends `bytes` and the reader releases them.
+    let receive = |flow: &mut FlowControl, bytes| {
+        flow.send_data(bytes).unwrap();
+        flow.assign_capacity(bytes).unwrap();
+    };
+    let mut large = FlowControl::new();
+    large.inc_window(16 << 20).unwrap();
+    large.assign_capacity(16 << 20).unwrap();
+    receive(&mut large, (1 << 20) - 1);
+    assert_eq!(large.unclaimed_capacity(), None);
+    receive(&mut large, 1);
+    assert_eq!(large.unclaimed_capacity(), Some(1 << 20));
+
+    // A small window still waits for half of what remains.
+    let mut small = FlowControl::new();
+    small.inc_window(65_535).unwrap();
+    small.assign_capacity(65_535).unwrap();
+    receive(&mut small, 20_000);
+    assert_eq!(small.unclaimed_capacity(), None);
+    receive(&mut small, 5_000);
+    assert_eq!(small.unclaimed_capacity(), Some(25_000));
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -98,7 +126,8 @@ impl FlowControl {
         }
 
         let unclaimed = available.0 - self.window_size.0;
-        let threshold = self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR;
+        let threshold =
+            (self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR).min(MAX_UNCLAIMED);
 
         if unclaimed < threshold {
             None
