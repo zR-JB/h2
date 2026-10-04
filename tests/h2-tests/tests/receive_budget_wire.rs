@@ -476,6 +476,7 @@ impl Meter {
 }
 
 impl h2::SharedBudget for Meter {
+    #[allow(deprecated)] // try_update needs Rust 1.99; the crate supports 1.63
     fn try_charge(&self, bytes: usize) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         let limit = self.limit;
