@@ -549,7 +549,7 @@ mod tests {
         state.handle_error(&Error::library_go_away(Reason::INTERNAL_ERROR));
 
         assert!(state.is_recv_end_stream());
-        assert_eq!(state.ensure_recv_open().unwrap(), false);
+        assert!(!state.ensure_recv_open().unwrap());
         assert_eq!(
             state.ensure_reason(PollReset::Streaming).unwrap(),
             Some(Reason::INTERNAL_ERROR)
@@ -563,7 +563,7 @@ mod tests {
         state.recv_eof();
 
         assert!(state.is_recv_end_stream());
-        assert_eq!(state.ensure_recv_open().unwrap(), false);
+        assert!(!state.ensure_recv_open().unwrap());
         assert!(state.ensure_reason(PollReset::Streaming).is_err());
     }
 }

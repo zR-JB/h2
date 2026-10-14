@@ -1328,6 +1328,22 @@ impl Recv {
     }
 }
 
+// ===== impl Open =====
+
+impl Open {
+    pub fn is_push_promise(&self) -> bool {
+        matches!(*self, Self::PushPromise)
+    }
+}
+
+// ===== impl RecvHeaderBlockError =====
+
+impl From<Error> for RecvHeaderBlockError {
+    fn from(err: Error) -> Self {
+        RecvHeaderBlockError::State(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,21 +1396,5 @@ mod tests {
         assert_eq!(recv.in_flight_data, 0);
         stream.unlink();
         stream.remove();
-    }
-}
-
-// ===== impl Open =====
-
-impl Open {
-    pub fn is_push_promise(&self) -> bool {
-        matches!(*self, Self::PushPromise)
-    }
-}
-
-// ===== impl RecvHeaderBlockError =====
-
-impl From<Error> for RecvHeaderBlockError {
-    fn from(err: Error) -> Self {
-        RecvHeaderBlockError::State(err)
     }
 }
